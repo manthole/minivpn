@@ -1,0 +1,5 @@
+/minivpn
+/dist/
+go.work
+go.work.sum
+*.key

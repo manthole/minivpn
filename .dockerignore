@@ -1,0 +1,7 @@
+go.work
+go.work.sum
+*.key
+data/
+minivpn
+dist/
+.git
