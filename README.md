@@ -195,3 +195,7 @@ docker/, Dockerfile      serveur de démonstration
 Protocole [Noise](https://noiseprotocol.org/) de Trevor Perrin, architecture inspirée de
 [WireGuard](https://www.wireguard.com/papers/wireguard.pdf) de Jason A. Donenfeld,
 implémentation Noise [flynn/noise](https://github.com/flynn/noise).
+
+## Licence
+
+Code et documentation sous [licence MIT](LICENSE) © 2026 Manthole : libre réutilisation, y compris commerciale, à condition de conserver la mention de copyright.
