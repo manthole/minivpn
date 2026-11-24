@@ -58,6 +58,8 @@ type peer struct {
 	endpoint  netip.AddrPort
 
 	lastInit                [timestampLen]byte
+	keys                    macKeys      // mac1 et clé de cookie dérivés de la clé publique du pair
+	cookie                  clientCookie // client : dernier cookie reçu du serveur
 	current, previous, next *session
 	pending                 *pendingHandshake
 	queue                   [][]byte
@@ -68,6 +70,7 @@ type peer struct {
 type pendingHandshake struct {
 	hs     *noise.HandshakeState
 	index  uint32
+	mac1   [macLen]byte // lie un éventuel message cookie à cette poignée de main
 	sentAt time.Time
 	first  time.Time
 }
@@ -79,6 +82,7 @@ type Node struct {
 	server   bool
 	static   noise.DHKey
 	public   Key
+	keys     macKeys // dérivées de notre clé publique : vérifier mac1, chiffrer les cookies
 	address  netip.Prefix
 	conn     PacketConn
 	dev      Device
@@ -90,7 +94,7 @@ type Node struct {
 	pending  map[uint32]*peer
 	upstream *peer
 	timing   timing
-	limiter  rateLimiter
+	cookies  cookieJar
 	now      func() time.Time
 	closing  atomic.Bool
 }
@@ -113,6 +117,7 @@ func newNode(priv Key, addr netip.Prefix, conn PacketConn, dev Device, logger *l
 	return &Node{
 		static:   noise.DHKey{Private: append([]byte(nil), priv[:]...), Public: append([]byte(nil), pub[:]...)},
 		public:   pub,
+		keys:     deriveMACKeys(pub),
 		address:  addr,
 		conn:     conn,
 		dev:      dev,
@@ -123,7 +128,7 @@ func newNode(priv Key, addr netip.Prefix, conn PacketConn, dev Device, logger *l
 		sessions: map[uint32]*session{},
 		pending:  map[uint32]*peer{},
 		timing:   defaultTiming,
-		limiter:  rateLimiter{rate: 100},
+		cookies:  newCookieJar(deriveMACKeys(pub)),
 		now:      time.Now,
 	}, nil
 }
@@ -149,7 +154,8 @@ func NewServer(cfg ServerConfig, conn PacketConn, dev Device, logger *log.Logger
 		case n.byIP[pc.Address] != nil:
 			return nil, fmt.Errorf("adresse client %s attribuée deux fois", pc.Address)
 		}
-		p := &peer{publicKey: pc.PublicKey, address: pc.Address, allowed: netip.PrefixFrom(pc.Address, 32)}
+		p := &peer{publicKey: pc.PublicKey, address: pc.Address, allowed: netip.PrefixFrom(pc.Address, 32),
+			keys: deriveMACKeys(pc.PublicKey)}
 		n.peers[pc.PublicKey] = p
 		n.byIP[pc.Address] = p
 	}
@@ -168,7 +174,8 @@ func NewClient(cfg ClientConfig, conn PacketConn, dev Device, logger *log.Logger
 	if cfg.ServerKey.IsZero() || cfg.ServerKey == n.public {
 		return nil, errors.New("clé publique du serveur manquante ou invalide")
 	}
-	p := &peer{publicKey: cfg.ServerKey, allowed: cfg.Address.Masked(), endpoint: cfg.Server}
+	p := &peer{publicKey: cfg.ServerKey, allowed: cfg.Address.Masked(), endpoint: cfg.Server,
+		keys: deriveMACKeys(cfg.ServerKey)}
 	n.peers[cfg.ServerKey] = p
 	n.upstream = p
 	return n, nil
@@ -358,9 +365,14 @@ func (n *Node) initiate(p *peer) {
 		n.log.Printf("poignée de main impossible : %v", err)
 		return
 	}
-	p.pending = &pendingHandshake{hs: hs, index: idx, sentAt: now, first: first}
+	msg, mac1 := appendMACs(msg, p.keys, &p.cookie, now)
+	p.pending = &pendingHandshake{hs: hs, index: idx, mac1: mac1, sentAt: now, first: first}
 	n.pending[idx] = p
-	n.debug.Printf("→ poignée de main envoyée à %s", p.endpoint)
+	if p.cookie.fresh(now) {
+		n.debug.Printf("→ poignée de main envoyée à %s, avec le cookie du serveur", p.endpoint)
+	} else {
+		n.debug.Printf("→ poignée de main envoyée à %s", p.endpoint)
+	}
 	n.write(p, msg)
 }
 
@@ -377,20 +389,44 @@ func (n *Node) handlePacket(pkt []byte, from netip.AddrPort) {
 		if !n.server {
 			n.handleResponse(pkt)
 		}
+	case msgCookie:
+		if !n.server {
+			n.handleCookie(pkt)
+		}
 	case msgData:
 		n.handleData(pkt, from)
 	}
 }
 
-// handleInit (serveur) : vérifie qui est le client, puis répond.
+// handleInit (serveur) : filtre les messages bon marché d'abord (mac1, puis cookie sous
+// charge), vérifie ensuite qui est le client, puis répond.
 func (n *Node) handleInit(pkt []byte, from netip.AddrPort) {
 	now := n.now()
 	if len(pkt) != initLen {
 		return
 	}
-	if !n.limiter.allow(now) {
-		n.debug.Printf("trop de poignées de main, message de %s ignoré", from)
+	if !validMAC1(pkt, n.keys) {
+		n.debug.Printf("rejeté sans calcul : mac1 invalide depuis %s (message forgé ou mauvaise clé serveur)", from)
 		return
+	}
+	j := &n.cookies
+	if j.underLoad(now) {
+		if !j.loaded {
+			j.loaded = true
+			n.log.Printf("sous charge : les poignées de main doivent présenter un cookie")
+		}
+		ck := j.cookieFor(from, now)
+		if !validMAC2(pkt, ck) {
+			// Aucun calcul coûteux : un cookie lié à l'adresse, et c'est tout.
+			if _, err := n.conn.WriteToUDPAddrPort(j.cookieReply(pkt, ck), from); err != nil {
+				n.debug.Printf("envoi vers %s impossible : %v", from, err)
+			}
+			return
+		}
+		if !j.allowIP(from.Addr(), now) {
+			n.debug.Printf("trop de poignées de main depuis %s, message ignoré", from)
+			return
+		}
 	}
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   cipherSuite,
@@ -403,7 +439,7 @@ func (n *Node) handleInit(pkt []byte, from netip.AddrPort) {
 	if err != nil {
 		return
 	}
-	payload, _, _, err := hs.ReadMessage(nil, pkt[8:])
+	payload, _, _, err := hs.ReadMessage(nil, pkt[8:initLen-macsLen])
 	if err != nil {
 		n.debug.Printf("poignée de main illisible depuis %s (mauvaise clé serveur ou message altéré)", from)
 		return
@@ -430,6 +466,7 @@ func (n *Node) handleInit(pkt []byte, from netip.AddrPort) {
 	if err != nil || cs1 == nil || cs2 == nil {
 		return
 	}
+	resp, _ = appendMACs(resp, p.keys, nil, now)
 	// cs1 chiffre client → serveur, cs2 serveur → client
 	s := &session{peer: p, local: idx, remote: binary.LittleEndian.Uint32(pkt[4:8]),
 		send: cs2.Cipher(), recv: cs1.Cipher(), created: now}
@@ -455,10 +492,14 @@ func (n *Node) handleResponse(pkt []byte) {
 	if p == nil || p.pending == nil || p.pending.index != local {
 		return
 	}
+	if !validMAC1(pkt, n.keys) {
+		n.debug.Printf("réponse rejetée sans calcul : mac1 invalide")
+		return
+	}
 	ph := p.pending
 	delete(n.pending, local)
 	p.pending = nil
-	_, cs1, cs2, err := ph.hs.ReadMessage(nil, pkt[12:])
+	_, cs1, cs2, err := ph.hs.ReadMessage(nil, pkt[12:respLen-macsLen])
 	if err != nil || cs1 == nil || cs2 == nil {
 		n.log.Printf("réponse invalide du serveur : la clé publique du serveur est-elle la bonne ?")
 		return
@@ -477,6 +518,28 @@ func (n *Node) handleResponse(pkt []byte) {
 	}
 	n.sendPacket(p, nil) // keepalive immédiat : confirme la session auprès du serveur
 	n.flushQueue(p)
+}
+
+// handleCookie (client) : le serveur est sous charge et nous envoie un cookie lié à notre
+// adresse. Comme WireGuard, on ne renvoie pas tout de suite la poignée de main : la
+// prochaine tentative (délai normal de relance) portera mac2, la preuve que l'on reçoit
+// bien les paquets envoyés à notre adresse.
+func (n *Node) handleCookie(pkt []byte) {
+	if len(pkt) != cookieLen {
+		return
+	}
+	local := binary.LittleEndian.Uint32(pkt[4:8])
+	p := n.pending[local]
+	if p == nil || p.pending == nil || p.pending.index != local {
+		return
+	}
+	ck, ok := openCookie(pkt, p.keys, p.pending.mac1)
+	if !ok {
+		n.debug.Printf("cookie invalide ignoré (faux message ou poignée de main différente)")
+		return
+	}
+	p.cookie = clientCookie{value: ck, received: n.now()}
+	n.log.Printf("serveur %s sous charge : cookie reçu, la prochaine tentative le présentera", p.endpoint)
 }
 
 // promote fait de s la session d'envoi. L'ancienne est gardée un moment pour déchiffrer
@@ -559,6 +622,13 @@ func (n *Node) handleData(pkt []byte, from netip.AddrPort) {
 // onTick : expiration des sessions, nouvelles tentatives, renouvellement des clés, keepalive.
 func (n *Node) onTick() {
 	now := n.now()
+	if n.server {
+		if j := &n.cookies; j.loaded && !now.Before(j.loadUntil) {
+			j.loaded = false
+			n.log.Printf("fin de la charge : poignées de main acceptées sans cookie")
+		}
+		n.cookies.forget(now)
+	}
 	for _, p := range n.peers {
 		for _, sp := range []**session{&p.current, &p.previous, &p.next} {
 			if *sp != nil && now.Sub((*sp).created) > n.timing.rejectAfterTime {

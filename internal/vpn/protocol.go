@@ -2,13 +2,15 @@ package vpn
 
 // Format des messages échangés en UDP. Tous les entiers sont en petit-boutiste.
 //
-//  Poignée de main, client → serveur (116 octets)
-//    type=1 | 3 octets à 0 | index de l'expéditeur (4) | message Noise n°1 (108)
+//  Poignée de main, client → serveur (148 octets, comme WireGuard)
+//    type=1 | 3 octets à 0 | index de l'expéditeur (4) | message Noise n°1 (108) | mac1 (16) | mac2 (16)
 //      message Noise n°1 = clé éphémère (32) | clé statique chiffrée (32+16) | horodatage chiffré (12+16)
 //
-//  Réponse, serveur → client (60 octets)
-//    type=2 | 3 octets à 0 | index de l'expéditeur (4) | index du destinataire (4) | message Noise n°2 (48)
+//  Réponse, serveur → client (92 octets)
+//    type=2 | 3 octets à 0 | index de l'expéditeur (4) | index du destinataire (4) | message Noise n°2 (48) | mac1 (16) | mac2 (16)
 //      message Noise n°2 = clé éphémère (32) | charge vide chiffrée (0+16)
+//
+//  Cookie, serveur sous charge → client (64 octets) : voir cookie.go
 //
 //  Données, dans les deux sens (32 octets minimum)
 //    type=4 | 3 octets à 0 | index du destinataire (4) | compteur (8) | paquet IP chiffré + étiquette (16)
@@ -30,8 +32,8 @@ const (
 
 	tagLen        = 16
 	timestampLen  = 12
-	initLen       = 8 + 32 + 32 + tagLen + timestampLen + tagLen // 116
-	respLen       = 12 + 32 + tagLen                             // 60
+	initLen       = 8 + 32 + 32 + tagLen + timestampLen + tagLen + macsLen // 148
+	respLen       = 12 + 32 + tagLen + macsLen                             // 92
 	dataHeaderLen = 16
 
 	// TunnelMTU : 1500 (Ethernet) − 20 (IPv4) − 8 (UDP) − 16 (en-tête) − 16 (étiquette) = 1440,
@@ -46,7 +48,7 @@ const (
 
 // prologue : texte mélangé à la poignée de main. Les deux côtés doivent avoir le même,
 // ce qui lie la session à la version du protocole.
-var prologue = []byte("minivpn v1")
+var prologue = []byte("minivpn v2")
 
 // Mêmes primitives que WireGuard : X25519, ChaCha20-Poly1305 et BLAKE2s.
 var cipherSuite = noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashBLAKE2s)
@@ -121,9 +123,8 @@ func parseIPv4(pkt []byte) (src, dst netip.Addr, ok bool) {
 	return netip.AddrFrom4([4]byte(pkt[12:16])), netip.AddrFrom4([4]byte(pkt[16:20])), true
 }
 
-// rateLimiter limite le nombre de poignées de main traitées par seconde. Chacune coûte
-// plusieurs calculs Diffie-Hellman : sans limite, un flot de faux messages saturerait le
-// processeur du serveur. (WireGuard va plus loin avec un mécanisme de « cookies ».)
+// rateLimiter : seau à jetons (rate jetons par seconde, au plus rate en réserve). Il sert à
+// détecter la charge du serveur et à limiter chaque adresse IP sous charge (voir cookie.go).
 type rateLimiter struct {
 	tokens float64
 	last   time.Time

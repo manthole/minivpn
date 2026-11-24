@@ -304,8 +304,13 @@ func TestWrongServerKey(t *testing.T) {
 	cli := startClient(t, cPriv, "10.8.0.2/24", srv.conn.addr(), wrong, nil)
 
 	cli.dev.in <- ipv4("10.8.0.2", "10.8.0.1", "x")
-	waitLog(t, srv.logs, "poignée de main illisible")
+	// mac1 est calculé avec la clé publique visée : le vrai serveur rejette le message
+	// avant tout calcul Diffie-Hellman.
+	waitLog(t, srv.logs, "mac1 invalide")
 	expectNothing(t, srv.dev.out, "mauvaise clé serveur")
+	if strings.Contains(srv.logs.String(), "poignée de main illisible") {
+		t.Fatal("le serveur a lancé le déchiffrement Noise d'un message au mauvais mac1")
+	}
 }
 
 func TestReplayedHandshakeRejected(t *testing.T) {
