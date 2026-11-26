@@ -1,4 +1,4 @@
-# Tests à chaque publication, sur Linux et sur un vrai Mac.
+# Tests à chaque publication, sur Linux et sur un vrai Mac, puis fuzzing du protocole.
 # Actions épinglées par empreinte de commit : une étiquette déplacée ne peut pas injecter de code.
 name: tests
 
@@ -38,3 +38,35 @@ jobs:
         run: |
           go build -o minivpn .
           sudo env "PATH=$PATH" "MINIVPN_BIN=$PWD/minivpn" go test -count=1 -tags e2e ./internal/e2e/ -v
+
+  fuzz:
+    # Le fuzzer de Go envoie des variantes abîmées des paquets au serveur et au client
+    # (voir internal/vpn/fuzz_test.go). Une entrée fautive est conservée en artefact :
+    # la copier dans internal/vpn/testdata/fuzz/ la rejoue à chaque « go test ».
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Dépendances (vérifiées par la base de sommes de contrôle de Go)
+        run: go mod tidy
+      - name: Fuzzing (paquets reçus d'Internet en priorité)
+        run: |
+          for target in FuzzServerPacket:180s FuzzClientPacket:90s FuzzReplayFilter:30s FuzzParseKey:15s FuzzParseIPv4:15s; do
+            name=${target%%:*}
+            echo "::group::$name (${target#*:})"
+            go test -run '^$' -fuzz "^${name}\$" -fuzztime "${target#*:}" ./internal/vpn/ || exit 1
+            echo "::endgroup::"
+          done
+      - name: Entrée fautive
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: entree-fautive-fuzzing
+          path: internal/vpn/testdata/fuzz/
+          if-no-files-found: ignore

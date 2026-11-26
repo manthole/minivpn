@@ -166,6 +166,37 @@ sudo go test -tags e2e ./internal/tun/ -v        # vraie interface (macOS ou Lin
 ./scripts/test-e2e.sh                            # tunnel complet réel (Linux)
 ```
 
+### Fuzzing
+
+Le serveur reçoit des paquets de n'importe qui sur Internet. Le fuzzer intégré à Go
+(`go test -fuzz`) leur envoie des millions de variantes abîmées, guidé par la couverture
+du code : il garde les variantes qui atteignent une branche nouvelle et les mute à
+nouveau. Les cibles (`internal/vpn/fuzz_test.go`) partent de vrais messages (poignée de
+main, réponse, cookie, paquets de données authentiques) et vérifient, pour chaque
+variante, bien plus que l'absence de plantage :
+
+| Cible | Ce qu'elle vérifie sur chaque paquet reçu |
+|---|---|
+| `FuzzServerPacket` | Serveur avec un tunnel établi, sous charge ou non : jamais plus d'octets renvoyés que reçus (pas d'amplification) ; rien n'arrive sur l'interface sans être authentique, et jamais deux fois ; un paquet forgé ne détourne pas l'adresse du client et ne remplace pas sa session |
+| `FuzzClientPacket` | Client en pleine poignée de main : seule la vraie réponse du serveur établit le tunnel, seul le vrai cookie est retenu, et le client ne répond jamais à un message forgé |
+| `FuzzReplayFilter` | La fenêtre anti-rejeu (RFC 6479) comparée à un modèle naïf qui retient tous les compteurs : mêmes décisions sur des suites arbitraires (désordre, pertes, rejeux, sauts) |
+| `FuzzParseKey`, `FuzzParseIPv4` | Une clé acceptée se relit à l'identique et sert ; un en-tête IPv4 accepté est bien formé |
+
+L'aléa des nœuds (clés éphémères, index, secret des cookies) est figé par une graine
+pendant le fuzzing : une variante fautive rejoue exactement la même poignée de main,
+donc l'échec se reproduit. Sans `-fuzz`, `go test` rejoue les entrées de départ comme des
+tests ordinaires ; l'intégration continue lance en plus quelques minutes de fuzzing à
+chaque publication et conserve l'entrée fautive en cas d'échec.
+
+```sh
+go test -run '^$' -fuzz '^FuzzServerPacket$' -fuzztime 60s ./internal/vpn/
+```
+
+Le fuzzer a rappelé un point de conception plutôt qu'un bug : les 16 derniers octets
+d'une réponse (`mac2`) ne sont pas authentifiés et le client ne les lit pas. C'est
+voulu, comme dans WireGuard : `mac2` ne sert qu'au destinataire sous charge. Modifier ces
+octets ne permet donc rien, et le test le dit désormais explicitement.
+
 ## Démarrage rapide sur macOS
 
 Prérequis : [Homebrew](https://brew.sh), puis `brew install go`, et
@@ -237,7 +268,7 @@ Choix volontaires pour garder le code lisible, ou fonctions pas encore écrites 
 
 ```
 main.go                  ligne de commande
-internal/vpn/            protocole : clés, messages, poignée de main, cookies, sessions, anti-rejeu
+internal/vpn/            protocole : clés, messages, poignée de main, cookies, sessions, anti-rejeu, fuzzing
 internal/tun/            interface virtuelle (utun sur macOS, /dev/net/tun sur Linux)
 internal/netcfg/         adresse et route de l'interface
 internal/e2e/            test réel (Linux, root)

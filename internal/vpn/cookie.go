@@ -28,9 +28,9 @@ package vpn
 
 import (
 	"crypto/cipher"
-	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
+	"io"
 	"net/netip"
 	"time"
 
@@ -131,6 +131,7 @@ func validMAC1(msg []byte, own macKeys) bool {
 // moins possible. Le chiffrement est préparé une fois, et le nonce de 24 octets est un
 // préfixe aléatoire tiré au démarrage suivi d'un compteur : unique sans appel système.
 type cookieJar struct {
+	random    io.Reader // crypto/rand ; figé par les tests de fuzzing
 	secret    [32]byte
 	secretAt  time.Time
 	aead      cipher.AEAD
@@ -143,14 +144,14 @@ type cookieJar struct {
 	perIP     map[netip.Addr]*rateLimiter
 }
 
-func newCookieJar(own macKeys) cookieJar {
+func newCookieJar(own macKeys, random io.Reader) cookieJar {
 	aead, err := chacha20poly1305.NewX(own.cookie[:])
 	if err != nil {
 		panic(err)
 	}
-	j := cookieJar{aead: aead, load: rateLimiter{rate: defaultLoadThreshold},
+	j := cookieJar{random: random, aead: aead, load: rateLimiter{rate: defaultLoadThreshold},
 		perIPRate: defaultPerIPRate, perIP: map[netip.Addr]*rateLimiter{}}
-	if _, err := rand.Read(j.nonceBase[:]); err != nil {
+	if _, err := io.ReadFull(random, j.nonceBase[:]); err != nil {
 		panic(err)
 	}
 	return j
@@ -159,7 +160,7 @@ func newCookieJar(own macKeys) cookieJar {
 // cookieFor calcule le cookie d'une adresse : MAC(secret, IP ‖ port).
 func (j *cookieJar) cookieFor(from netip.AddrPort, now time.Time) [macLen]byte {
 	if j.secretAt.IsZero() || now.Sub(j.secretAt) >= cookieSecretLifetime {
-		if _, err := rand.Read(j.secret[:]); err != nil {
+		if _, err := io.ReadFull(j.random, j.secret[:]); err != nil {
 			panic(err)
 		}
 		j.secretAt = now

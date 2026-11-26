@@ -228,7 +228,7 @@ func TestForgedResponseRejectedBeforeAnyDH(t *testing.T) {
 }
 
 func TestCookieSecretRotatesAndPerIPLimit(t *testing.T) {
-	j := newCookieJar(deriveMACKeys(Key{1}))
+	j := newCookieJar(deriveMACKeys(Key{1}), rand.Reader)
 	t0 := time.Now()
 	a := netip.MustParseAddrPort("192.0.2.10:51820")
 	b := netip.MustParseAddrPort("192.0.2.11:51820")
@@ -262,7 +262,7 @@ func TestCookieSecretRotatesAndPerIPLimit(t *testing.T) {
 }
 
 func TestCookieNoncesNeverRepeat(t *testing.T) {
-	j := newCookieJar(deriveMACKeys(Key{1}))
+	j := newCookieJar(deriveMACKeys(Key{1}), rand.Reader)
 	init := forgedInit(Key{1})
 	ck := j.cookieFor(netip.MustParseAddrPort("192.0.2.10:1"), time.Now())
 	seen := map[string]bool{}
@@ -280,7 +280,7 @@ func TestCookieNoncesNeverRepeat(t *testing.T) {
 }
 
 func TestLoadEndsAfterAttack(t *testing.T) {
-	j := newCookieJar(deriveMACKeys(Key{1}))
+	j := newCookieJar(deriveMACKeys(Key{1}), rand.Reader)
 	t0 := time.Now()
 	for i := 0; i < 200; i++ {
 		j.underLoad(t0)

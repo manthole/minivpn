@@ -96,6 +96,7 @@ type Node struct {
 	timing   timing
 	cookies  cookieJar
 	now      func() time.Time
+	random   io.Reader // clés éphémères et index de session (les tests de fuzzing le figent)
 	closing  atomic.Bool
 }
 
@@ -128,8 +129,9 @@ func newNode(priv Key, addr netip.Prefix, conn PacketConn, dev Device, logger *l
 		sessions: map[uint32]*session{},
 		pending:  map[uint32]*peer{},
 		timing:   defaultTiming,
-		cookies:  newCookieJar(deriveMACKeys(pub)),
+		cookies:  newCookieJar(deriveMACKeys(pub), rand.Reader),
 		now:      time.Now,
+		random:   rand.Reader,
 	}, nil
 }
 
@@ -316,7 +318,7 @@ func (n *Node) write(p *peer, b []byte) {
 func (n *Node) newIndex() uint32 {
 	var b [4]byte
 	for {
-		if _, err := rand.Read(b[:]); err != nil {
+		if _, err := io.ReadFull(n.random, b[:]); err != nil {
 			panic(err)
 		}
 		v := binary.LittleEndian.Uint32(b[:])
@@ -344,7 +346,7 @@ func (n *Node) initiate(p *peer) {
 	}
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   cipherSuite,
-		Random:        rand.Reader,
+		Random:        n.random,
 		Pattern:       noise.HandshakeIK,
 		Initiator:     true,
 		Prologue:      prologue,
@@ -430,7 +432,7 @@ func (n *Node) handleInit(pkt []byte, from netip.AddrPort) {
 	}
 	hs, err := noise.NewHandshakeState(noise.Config{
 		CipherSuite:   cipherSuite,
-		Random:        rand.Reader,
+		Random:        n.random,
 		Pattern:       noise.HandshakeIK,
 		Initiator:     false,
 		Prologue:      prologue,
